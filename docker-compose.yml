@@ -1,0 +1,12 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8457:8457"
+    environment:
+      PORTA: "8457"
+  banco:
+    image: postgres:11
+    environment:
+      POSTGRES_USER: market
+      POSTGRES_PASSWORD: REMOVED_FOR_SECURITY

@@ -1,0 +1,247 @@
+name: Citizen Tech DevSecOps RM 564137
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ctmarket:564137
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  build:
+    name: (1) Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+      - name: Set up Python
+        uses: actions/setup-python@v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Compile application modules
+        run: python -m compileall -q app.py config loja worker
+
+  sast:
+    name: (2) SAST
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+      - name: Set up Python
+        uses: actions/setup-python@v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Semgrep
+        run: python -m pip install --disable-pip-version-check semgrep
+      - name: Scan source and fail on high or critical findings
+        run: semgrep scan --config p/default --config p/security-audit --severity ERROR --error --json --output sast.json .
+      - name: Publish SAST report
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: sast-report
+          path: sast.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  secrets:
+    name: (3) Secrets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Scan files and Git history
+        id: gitleaks
+        run: |
+          set +e
+          docker run --rm -v "$PWD:/repo" -w /repo zricethezav/gitleaks:v8.30.1 \
+            dir . --report-format json --report-path secrets-files.json --no-banner
+          files_status=$?
+          docker run --rm -v "$PWD:/repo" -w /repo zricethezav/gitleaks:v8.30.1 \
+            git . --log-opts="--all" --report-format json --report-path secrets-history.json --no-banner
+          history_status=$?
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          merged = {}
+          for filename in ("secrets-files.json", "secrets-history.json"):
+              path = Path(filename)
+              findings = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+              for item in findings:
+                  key = item.get("Fingerprint") or (
+                      item.get("RuleID"), item.get("File"),
+                      item.get("StartLine"), item.get("Secret")
+                  )
+                  merged[key] = item
+          Path("secrets.json").write_text(
+              json.dumps(list(merged.values()), indent=2) + "\n", encoding="utf-8"
+          )
+          PY
+          if [ "$files_status" -ne 0 ] || [ "$history_status" -ne 0 ]; then
+            echo "Gitleaks found secrets or could not complete the scan."
+            exit 1
+          fi
+      - name: Publish secrets reports
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: secrets-reports
+          path: |
+            secrets-files.json
+            secrets-history.json
+            secrets.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  sca:
+    name: (4) SCA
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+      - name: Set up Python
+        uses: actions/setup-python@v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install pip-audit
+        run: python -m pip install --disable-pip-version-check pip-audit==2.9.0
+      - name: Audit every Python requirements manifest
+        run: |
+          set +e
+          pip-audit -r requirements.txt --format json --output sca-root.json
+          root_status=$?
+          pip-audit -r worker/requirements.txt --format json --output sca-worker.json
+          worker_status=$?
+          if [ "$root_status" -ne 0 ] || [ "$worker_status" -ne 0 ]; then
+            echo "pip-audit reported vulnerable or unresolved dependencies."
+            exit 1
+          fi
+      - name: Publish SCA reports
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: sca-reports
+          path: sca-*.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  tests:
+    name: (5) Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+      - name: Set up Python
+        uses: actions/setup-python@v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Compile and run unit tests
+        run: |
+          python -m compileall -q app.py config loja worker
+          python -m unittest discover -v
+
+  image:
+    name: (6) Build and scan image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+      - name: Build required image tag
+        run: docker build --tag "$IMAGE_NAME" .
+      - name: Scan image and fail on high or critical vulnerabilities
+        run: |
+          docker run --rm \
+            -e DOCKER_HOST=unix:///var/run/docker.sock \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD:/work" -w /work \
+            ghcr.io/aquasecurity/trivy:0.76.2 \
+            image --format json --output trivy-image.json \
+            --severity HIGH,CRITICAL --exit-code 1 "$IMAGE_NAME"
+      - name: Publish image report
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: image-report
+          path: trivy-image.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  dast:
+    name: (7) Active DAST
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+      - name: Build and start application
+        run: |
+          docker build --tag "$IMAGE_NAME" .
+          docker run --detach --name ctmarket --publish 8457:8457 \
+            --env PORTA=8457 "$IMAGE_NAME"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8457/ >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs ctmarket
+          exit 1
+      - name: Run ZAP spider and active scan
+        run: |
+          mkdir -p zap-output
+          chmod 0777 zap-output
+          set +e
+          docker run --rm --network host -v "$PWD/zap-output:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py -t http://127.0.0.1:8457 \
+            -J /zap/wrk/dast.json -j
+          zap_status=$?
+          set -e
+          test -s zap-output/dast.json
+          if [ "$zap_status" -gt 2 ]; then
+            echo "ZAP could not complete the active scan."
+            exit "$zap_status"
+          fi
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path("zap-output/dast.json").read_text(encoding="utf-8"))
+          high = []
+          for site in report.get("site", []):
+              for alert in site.get("alerts", []):
+                  try:
+                      risk = int(alert.get("riskcode", 0))
+                  except (TypeError, ValueError):
+                      risk = 0
+                  if risk >= 3:
+                      high.append(alert.get("alert", "high-risk alert"))
+          print("ZAP high-risk alerts:", len(high))
+          if high:
+              raise SystemExit(1)
+          PY
+      - name: Publish DAST report
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: dast-report
+          path: zap-output/dast.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  deploy:
+    name: (8) Protected deploy
+    runs-on: ubuntu-latest
+    needs: [build, sast, secrets, sca, tests, image, dast]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+    steps:
+      - name: Deploy after every gate passes
+        run: echo "All security and test gates passed for RM 564137; production environment approval is required."
